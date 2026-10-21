@@ -1,0 +1,30 @@
+[build-system]
+requires = ["uv_build>=0.9.22,<0.10.0"]
+build-backend = "uv_build"
+
+[project]
+name = "eddynet"
+version = "0.1.0"
+description = "Eddy current testing crack profile reconstruction"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+    "scipy>=1.18.1",
+]
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[dependency-groups]
+dev = [
+    "ruff",
+]
