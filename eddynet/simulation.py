@@ -6,9 +6,12 @@ those fields to get the coil's impedance change"""
 
 import dataclasses
 import functools
+import os
+from contextlib import contextmanager
 from itertools import product
-from multiprocessing import Pool
+from multiprocessing import get_context
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 from scipy.ndimage import median_filter
@@ -45,6 +48,10 @@ DEFAULT_SPECIMEN_RELATIVE_PERMEABILITY = 1.0
 DEFAULT_SPECIMEN_THICKNESS_M = None
 DEFAULT_X_STEPS = 40
 DEFAULT_Y_STEPS = 40
+# Each worker also needs its own matrix factors and batched current arrays.
+DEFAULT_WORKERS = min(4, os.process_cpu_count() or 1)
+
+_WORKER_CACHE = {}
 
 
 def impedance_change(e_inc, j_ind, weights, source_current):
@@ -104,12 +111,48 @@ def incident_field(points, coil_xy, frequency_hz, sample_a_phi):
     )
 
 
+@contextmanager
+def _simulation_pool(workers, *, initializer=None, initargs=()):
+    """Limit each worker's numerical libraries to one thread.
+
+    Spawned workers inherit these settings before importing NumPy or SciPy.
+    This prevents each worker from starting a full CPU's worth of solver threads.
+    Keep the settings for replacement workers, then restore the parent's values.
+    """
+    thread_variables = (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    )
+    previous = {name: os.environ.get(name) for name in thread_variables}
+    try:
+        os.environ.update(dict.fromkeys(thread_variables, "1"))
+        with get_context("spawn").Pool(
+            processes=workers, initializer=initializer, initargs=initargs
+        ) as pool:
+            yield pool
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def precompute_incident_fields(
-    points, frequencies_mhz, *, probe, x_steps, y_steps, scan_step_m
+    points,
+    frequencies_mhz,
+    *,
+    probe,
+    x_steps,
+    y_steps,
+    scan_step_m,
+    workers=DEFAULT_WORKERS,
 ):
     """Cache fields shaped (scan_positions, grid_cells, 3) for each frequency."""
     fields_by_frequency = {}
-    with Pool() as pool:
+    with _simulation_pool(workers) as pool:
         for freq_mhz in frequencies_mhz:
             calc = functools.partial(
                 calc_incident_field,
@@ -124,6 +167,64 @@ def precompute_incident_fields(
                 x_steps * y_steps, len(points), 3
             )
     return fields_by_frequency
+
+
+def _precompute_simulation_cache(
+    cache_dir, points, frequencies_mhz, *, probe, x_steps, y_steps, scan_step_m, workers
+):
+    """Write temporary NumPy files that crack workers can map into shared memory."""
+    for index, freq_mhz in enumerate(frequencies_mhz):
+        np.save(
+            cache_dir / f"operator_{index}.npy",
+            build_electric_field_operator(points, freq_mhz * 1e6),
+        )
+    fields = precompute_incident_fields(
+        points,
+        frequencies_mhz,
+        probe=probe,
+        x_steps=x_steps,
+        y_steps=y_steps,
+        scan_step_m=scan_step_m,
+        workers=workers,
+    )
+    for index, freq_mhz in enumerate(frequencies_mhz):
+        np.save(cache_dir / f"incident_{index}.npy", fields[freq_mhz])
+
+
+def _initialize_crack_worker(cache_dir, frequencies_mhz):
+    """Open read-only cache mappings once per worker, without copying the arrays."""
+    global _WORKER_CACHE
+    _WORKER_CACHE = {
+        freq_mhz: (
+            np.load(cache_dir / f"operator_{index}.npy", mmap_mode="r"),
+            np.load(cache_dir / f"incident_{index}.npy", mmap_mode="r"),
+        )
+        for index, freq_mhz in enumerate(frequencies_mhz)
+    }
+
+
+def _save_crack_sample(sample, *, root_dir, source_current_a, response_shape):
+    """Compute and save one crack's frequency maps using the worker's grid cache."""
+    index, crack = sample
+    crack_id = f"{index:06d}"
+    np.savez(root_dir / "cracks" / f"{crack_id}.npz", crack=crack)
+    points = make_crack_points(crack)
+    cell_indices = np.flatnonzero(crack)
+    # Each cell occupies three consecutive matrix rows and columns for XYZ.
+    component_indices = (3 * cell_indices[:, None] + np.arange(3)).ravel()
+
+    for freq_mhz, (full_operator, full_fields) in _WORKER_CACHE.items():
+        field_operator = full_operator[np.ix_(component_indices, component_indices)]
+        solver = prepare_induced_current_solver(
+            points, freq_mhz * 1e6, field_operator=field_operator
+        )
+        # The incident field does not depend on which cells form the crack.
+        e_inc = full_fields[:, cell_indices, :]
+        j_ind, weights = solver.solve(e_inc)
+        response_map = impedance_change(
+            e_inc, j_ind, weights, source_current_a
+        ).reshape(response_shape)
+        np.savez(root_dir / f"{freq_mhz}MHz" / f"{crack_id}.npz", delta_z=response_map)
 
 
 def generate_test_data(
@@ -148,55 +249,49 @@ def generate_test_data(
     specimen_thickness_m=DEFAULT_SPECIMEN_THICKNESS_M,
     x_steps=DEFAULT_X_STEPS,
     y_steps=DEFAULT_Y_STEPS,
+    workers=DEFAULT_WORKERS,
 ):
-    """Reuse grid interactions and incident fields; factor each crack/frequency once."""
+    """Generate cracks in the parent and compute their maps in persistent workers.
+
+    Workers share read-only grid caches and process all frequencies for a crack.
+    The default uses at most four workers to limit memory for per-crack solves.
+    """
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    frequencies_mhz = tuple(frequencies_mhz)
     root_dir = Path("data")
+    folders = ["cracks"] + [f"{freq}MHz" for freq in frequencies_mhz]
+    for folder in folders:
+        (root_dir / folder).mkdir(exist_ok=True, parents=True)
     profile_shape = (40, 12)
     full_grid_points = make_crack_points(np.ones(profile_shape, dtype=bool))
-    full_field_operators = {
-        freq_mhz: build_electric_field_operator(full_grid_points, freq_mhz * 1e6)
-        for freq_mhz in frequencies_mhz
-    }
-    full_incident_fields = precompute_incident_fields(
-        full_grid_points,
-        frequencies_mhz,
-        probe=MockProbe(current_a=source_current_a),
-        x_steps=x_steps,
-        y_steps=y_steps,
-        scan_step_m=scan_step_m,
-    )
-
-    for i in tqdm(range(size)):
-        crack_id = f"{i:06d}"
-        crack = generate_crack_profile(*profile_shape)
-        crack_path = root_dir / "cracks"
-        crack_path.mkdir(exist_ok=True, parents=True)
-        np.savez(crack_path / f"{crack_id}.npz", crack=crack)
-        points = make_crack_points(crack)
-        cell_indices = np.flatnonzero(crack)
-        # Each cell occupies three consecutive matrix rows and columns for XYZ.
-        component_indices = (3 * cell_indices[:, None] + np.arange(3)).ravel()
-
-        for freq_mhz in frequencies_mhz:
-            freq_path = root_dir / f"{freq_mhz}MHz"
-            freq_path.mkdir(exist_ok=True, parents=True)
-
-            freq = freq_mhz * 1e6
-            field_operator = full_field_operators[freq_mhz][
-                np.ix_(component_indices, component_indices)
-            ]
-
-            solver = prepare_induced_current_solver(
-                points, freq, field_operator=field_operator
-            )
-            # The incident field does not depend on which cells form the crack.
-            e_inc = full_incident_fields[freq_mhz][:, cell_indices, :]
-            j_ind, weights = solver.solve(e_inc)
-            response_map = impedance_change(
-                e_inc, j_ind, weights, source_current_a
-            ).reshape(x_steps, y_steps)
-
-            np.savez(freq_path / f"{crack_id}.npz", delta_z=response_map)
+    with TemporaryDirectory(prefix="eddynet-") as cache_dir:
+        cache_dir = Path(cache_dir)
+        _precompute_simulation_cache(
+            cache_dir,
+            full_grid_points,
+            frequencies_mhz,
+            probe=MockProbe(current_a=source_current_a),
+            x_steps=x_steps,
+            y_steps=y_steps,
+            scan_step_m=scan_step_m,
+            workers=workers,
+        )
+        save_sample = functools.partial(
+            _save_crack_sample,
+            root_dir=root_dir,
+            source_current_a=source_current_a,
+            response_shape=(x_steps, y_steps),
+        )
+        # Send only small crack masks; the large caches stay mapped in workers.
+        samples = ((i, generate_crack_profile(*profile_shape)) for i in range(size))
+        with _simulation_pool(
+            workers,
+            initializer=_initialize_crack_worker,
+            initargs=(cache_dir, frequencies_mhz),
+        ) as pool:
+            for _ in tqdm(pool.imap_unordered(save_sample, samples), total=size):
+                pass
 
 
 def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_map):
@@ -218,4 +313,4 @@ def calc_incident_field(row, column, points, freq, probe: MockProbe, scan_step_m
 
 if __name__ == "__main__":
     # generate_crack_profile(plot=True)
-    generate_test_data(size=100)
+    generate_test_data(size=5000, workers=11)
