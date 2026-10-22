@@ -6,7 +6,6 @@ those fields to get the coil's impedance change"""
 
 import dataclasses
 import functools
-from datetime import datetime
 from itertools import product
 from multiprocessing import Pool
 from pathlib import Path
@@ -105,6 +104,28 @@ def incident_field(points, coil_xy, frequency_hz, sample_a_phi):
     )
 
 
+def precompute_incident_fields(
+    points, frequencies_mhz, *, probe, x_steps, y_steps, scan_step_m
+):
+    """Cache fields shaped (scan_positions, grid_cells, 3) for each frequency."""
+    fields_by_frequency = {}
+    with Pool() as pool:
+        for freq_mhz in frequencies_mhz:
+            calc = functools.partial(
+                calc_incident_field,
+                points=points,
+                freq=freq_mhz * 1e6,
+                probe=probe,
+                scan_step_m=scan_step_m,
+            )
+            # starmap preserves the row/column order produced by product.
+            fields = pool.starmap(calc, product(range(x_steps), range(y_steps)))
+            fields_by_frequency[freq_mhz] = np.asarray(fields, dtype=complex).reshape(
+                x_steps * y_steps, len(points), 3
+            )
+    return fields_by_frequency
+
+
 def generate_test_data(
     size=20_000,
     *,
@@ -128,7 +149,7 @@ def generate_test_data(
     x_steps=DEFAULT_X_STEPS,
     y_steps=DEFAULT_Y_STEPS,
 ):
-    """Reuse full-grid interactions and factor each crack/frequency matrix once."""
+    """Reuse grid interactions and incident fields; factor each crack/frequency once."""
     root_dir = Path("data")
     profile_shape = (40, 12)
     full_grid_points = make_crack_points(np.ones(profile_shape, dtype=bool))
@@ -136,6 +157,14 @@ def generate_test_data(
         freq_mhz: build_electric_field_operator(full_grid_points, freq_mhz * 1e6)
         for freq_mhz in frequencies_mhz
     }
+    full_incident_fields = precompute_incident_fields(
+        full_grid_points,
+        frequencies_mhz,
+        probe=MockProbe(current_a=source_current_a),
+        x_steps=x_steps,
+        y_steps=y_steps,
+        scan_step_m=scan_step_m,
+    )
 
     for i in tqdm(range(size)):
         crack_id = f"{i:06d}"
@@ -157,39 +186,16 @@ def generate_test_data(
                 np.ix_(component_indices, component_indices)
             ]
 
-            probe = MockProbe(coil_xy=(0.0, 0.0), current_a=source_current_a)
-
-            start = datetime.now()
             solver = prepare_induced_current_solver(
                 points, freq, field_operator=field_operator
             )
-            # for each coil pos, calculate e_inc at every crack cell
-            calc = functools.partial(
-                calc_incident_field,
-                points=points,
-                freq=freq,
-                probe=probe,
-                scan_step_m=scan_step_m,
-            )
-            x_range = np.arange(x_steps).tolist()
-            y_range = np.arange(y_steps).tolist()
-
-            # for one crack
-            # mp time 0:02:51.489267
-            # sequential time 0:11:25.051254
-            with Pool() as pool:
-                fields = pool.starmap(calc, product(x_range, y_range))
-
-            # starmap preserves the row/column order produced by product.
-            e_inc = np.asarray(fields, dtype=complex).reshape(
-                x_steps * y_steps, len(points), 3
-            )
+            # The incident field does not depend on which cells form the crack.
+            e_inc = full_incident_fields[freq_mhz][:, cell_indices, :]
             j_ind, weights = solver.solve(e_inc)
             response_map = impedance_change(
                 e_inc, j_ind, weights, source_current_a
             ).reshape(x_steps, y_steps)
 
-            print("mp time", datetime.now() - start)
             np.savez(freq_path / f"{crack_id}.npz", delta_z=response_map)
 
 
@@ -212,4 +218,4 @@ def calc_incident_field(row, column, points, freq, probe: MockProbe, scan_step_m
 
 if __name__ == "__main__":
     # generate_crack_profile(plot=True)
-    generate_test_data(size=10)
+    generate_test_data(size=100)
