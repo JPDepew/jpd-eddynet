@@ -9,10 +9,11 @@ import functools
 from datetime import datetime
 from itertools import product
 from multiprocessing import Pool
+from pathlib import Path
 
 import numpy as np
-import tqdm
 from scipy.ndimage import median_filter
+from tqdm import tqdm
 
 from eddynet.incident_field_solver import MockProbe, solve_incident_field
 from eddynet.induced_current_solver import make_crack_points, solve_induced_current
@@ -129,12 +130,18 @@ def generate_test_data(
     y_steps=DEFAULT_Y_STEPS,
 ):
     """Prepare crack profiles using configurable forward-model settings."""
+    root_dir = Path("data")
 
-    for freq in frequencies_mhz:
-        print(f"Calcluating for freq {freq} MHz")
+    for i in tqdm(range(size)):
+        crack_id = f"{i:6}"
+        crack = generate_crack_profile()
+        crack_path = root_dir / "cracks"
+        crack_path.mkdir(exist_ok=True, parents=True)
+        np.savez(crack_path / f"{crack_id}.npz")
 
-        for _ in tqdm(range(size)):
-            crack = generate_crack_profile()
+        for freq in frequencies_mhz:
+            freq_path = root_dir / f"{freq}MHz"
+            freq_path.mkdir(exist_ok=True, parents=True)
 
             freq = frequencies_mhz[0] * 1e6
 
@@ -167,6 +174,7 @@ def generate_test_data(
                 response_map[x, y] = val
 
             print("mp time", datetime.now() - start)
+            np.savez(freq_path / f"{crack_id}.npz")
 
 
 def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_map):
