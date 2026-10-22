@@ -133,7 +133,7 @@ def generate_test_data(
     root_dir = Path("data")
 
     for i in tqdm(range(size)):
-        crack_id = f"{i:6}"
+        crack_id = f"{i:6d}"
         crack = generate_crack_profile()
         crack_path = root_dir / "cracks"
         crack_path.mkdir(exist_ok=True, parents=True)
