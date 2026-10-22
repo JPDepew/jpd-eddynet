@@ -16,7 +16,11 @@ from scipy.ndimage import median_filter
 from tqdm import tqdm
 
 from eddynet.incident_field_solver import MockProbe, solve_incident_field
-from eddynet.induced_current_solver import make_crack_points, solve_induced_current
+from eddynet.induced_current_solver import (
+    build_electric_field_operator,
+    make_crack_points,
+    solve_induced_current,
+)
 
 # Starter values for the probe and specimen. The EddyNet paper does not give
 # these dimensions or material values, so callers should replace them with
@@ -41,6 +45,9 @@ DEFAULT_SPECIMEN_RELATIVE_PERMEABILITY = 1.0
 DEFAULT_SPECIMEN_THICKNESS_M = None
 DEFAULT_X_STEPS = 40
 DEFAULT_Y_STEPS = 40
+
+# Installed once per worker to avoid sending the matrix with every position task.
+_worker_field_operator = None
 
 
 def impedance_change(e_inc, j_ind, weights, source_current):
@@ -129,23 +136,34 @@ def generate_test_data(
     x_steps=DEFAULT_X_STEPS,
     y_steps=DEFAULT_Y_STEPS,
 ):
-    """Prepare crack profiles using configurable forward-model settings."""
+    """Generate responses using full-grid interaction matrices reused across cracks."""
     root_dir = Path("data")
+    profile_shape = (40, 12)
+    full_grid_points = make_crack_points(np.ones(profile_shape, dtype=bool))
+    full_field_operators = {
+        freq_mhz: build_electric_field_operator(full_grid_points, freq_mhz * 1e6)
+        for freq_mhz in frequencies_mhz
+    }
 
     for i in tqdm(range(size)):
         crack_id = f"{i:6d}"
-        crack = generate_crack_profile()
+        crack = generate_crack_profile(*profile_shape)
         crack_path = root_dir / "cracks"
         crack_path.mkdir(exist_ok=True, parents=True)
         np.savez(crack_path / f"{crack_id}.npz")
+        points = make_crack_points(crack)
+        cell_indices = np.flatnonzero(crack)
+        # Each cell occupies three consecutive matrix rows and columns for XYZ.
+        component_indices = (3 * cell_indices[:, None] + np.arange(3)).ravel()
 
-        for freq in frequencies_mhz:
-            freq_path = root_dir / f"{freq}MHz"
+        for freq_mhz in frequencies_mhz:
+            freq_path = root_dir / f"{freq_mhz}MHz"
             freq_path.mkdir(exist_ok=True, parents=True)
 
-            freq = frequencies_mhz[0] * 1e6
-
-            points = make_crack_points(crack)
+            freq = freq_mhz * 1e6
+            field_operator = full_field_operators[freq_mhz][
+                np.ix_(component_indices, component_indices)
+            ]
 
             probe = MockProbe(coil_xy=(0.0, 0.0), current_a=source_current_a)
 
@@ -166,7 +184,9 @@ def generate_test_data(
             # for one crack
             # mp time 0:02:51.489267
             # sequential time 0:11:25.051254
-            with Pool() as pool:
+            with Pool(
+                initializer=_set_worker_field_operator, initargs=(field_operator,)
+            ) as pool:
                 # TODO: probe needs to move
                 results = pool.starmap(calc, product(x_range, y_range))
 
@@ -186,6 +206,12 @@ def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_
     response_map[x, y] = delta_z
 
 
+def _set_worker_field_operator(field_operator):
+    """Give each worker this crack's matrix once when its pool starts."""
+    global _worker_field_operator
+    _worker_field_operator = field_operator
+
+
 def calc_impedance_change_m(
     x, y, points, freq, probe: MockProbe, source_current_a, scan_step_m
 ):
@@ -194,7 +220,9 @@ def calc_impedance_change_m(
     _probe: MockProbe = dataclasses.replace(probe)
     _probe.coil_xy = (probe_coil_y, probe_coil_x)
     e_inc = solve_incident_field(points, frequency_hz=freq, probe=_probe)
-    j_ind, weights = solve_induced_current(points, e_inc, freq)
+    j_ind, weights = solve_induced_current(
+        points, e_inc, freq, field_operator=_worker_field_operator
+    )
 
     delta_z = impedance_change(e_inc, j_ind, weights, source_current_a)
     return x, y, delta_z
