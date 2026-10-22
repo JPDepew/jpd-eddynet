@@ -11,8 +11,12 @@ The bulk kernel follows the unbounded-domain part of Bowler et al. (1991):
 https://class.ece.iastate.edu/jbowler/My%20Articles/JAP_Vol_Flaw.pdf
 """
 
+import warnings
+from dataclasses import dataclass
+
 import numpy as np
 from numpy.polynomial.legendre import leggauss
+from scipy.linalg import LinAlgWarning, lu_factor, lu_solve
 
 from eddynet.incident_field_solver import (
     VACUUM_PERMEABILITY_H_PER_M,
@@ -21,6 +25,37 @@ from eddynet.incident_field_solver import (
 
 # Illustrative cell dimensions along x, y, z; replace with physical dimensions.
 DEFAULT_CRACK_CELL_SIZE_M = (0.1e-3, 0.1e-3, 0.1e-3)
+
+
+@dataclass
+class PreparedInducedCurrentSolver:
+    """Prepared current equation with reusable lower/upper (LU) matrix factors."""
+
+    factorization: tuple[np.ndarray, np.ndarray] | None
+    delta_sigma: float
+    volumes: np.ndarray
+
+    def solve(self, e_inc):
+        """Solve one field (n, 3) or batches (..., n, 3), returning currents and volumes.
+
+        Each field uses the same crack and frequency. Batch fields become columns
+        of a single right-hand-side matrix, so the LU factors are reused for all
+        probe positions. Currents have the same shape as e_inc, in A/m^2.
+        """
+        fields = np.asarray(e_inc, dtype=complex)
+        n = len(self.volumes)
+        if (
+            fields.ndim < 2
+            or fields.shape[-2:] != (n, 3)
+            or not np.all(np.isfinite(fields))
+        ):
+            raise ValueError("e_inc must contain finite fields shaped (..., n, 3)")
+        if fields.size == 0 or self.delta_sigma == 0:
+            return np.zeros_like(fields), self.volumes
+
+        rhs = (self.delta_sigma * fields).reshape(-1, 3 * n).T
+        currents = lu_solve(self.factorization, rhs)
+        return currents.T.reshape(fields.shape), self.volumes
 
 
 def solve_induced_current(
@@ -33,12 +68,36 @@ def solve_induced_current(
     crack_conductivity_s_per_m=0.0,
     field_operator=None,
 ):
-    """Return equivalent current densities (n, 3) and volume weights (n,).
+    """Return equivalent current densities (..., n, 3) and volume weights (n,).
 
-    crack_points contains XYZ cell centers in meters. e_inc contains complex
-    electric fields in V/m at those same centers. Each cell has the uniform
-    dimensions cell_size_m, ordered x, y, z. Returned currents are in A/m^2
-    and weights are in m^3. Empty cracks return empty arrays.
+    e_inc contains fields in V/m for one probe position or a batch of positions.
+    For repeated calls with the same crack and frequency, prepare the solver once
+    with prepare_induced_current_solver, then call its solve method instead.
+    """
+    solver = prepare_induced_current_solver(
+        crack_points,
+        frequency_hz,
+        cell_size_m=cell_size_m,
+        specimen=specimen,
+        crack_conductivity_s_per_m=crack_conductivity_s_per_m,
+        field_operator=field_operator,
+    )
+    return solver.solve(e_inc)
+
+
+def prepare_induced_current_solver(
+    crack_points,
+    frequency_hz,
+    *,
+    cell_size_m=DEFAULT_CRACK_CELL_SIZE_M,
+    specimen=None,
+    crack_conductivity_s_per_m=0.0,
+    field_operator=None,
+):
+    """Factor the current equation once for a fixed crack and frequency.
+
+    crack_points contains XYZ cell centers in meters. Each cell has the uniform
+    dimensions cell_size_m, ordered x, y, z. Volume weights are in m^3.
 
     These are equivalent sources representing the conductivity change, not
     conduction currents inside the air gap. The solve is
@@ -52,9 +111,6 @@ def solve_induced_current(
     points, cell_size = _validate_cell_geometry(crack_points, cell_size_m)
     specimen = MockSpecimen() if specimen is None else specimen
     conductivity, _ = _material_properties(frequency_hz, specimen)
-    e_inc = np.asarray(e_inc, dtype=complex)
-    if e_inc.shape != points.shape or not np.all(np.isfinite(e_inc)):
-        raise ValueError("e_inc must contain one finite XYZ field per crack point")
     if not np.isfinite(crack_conductivity_s_per_m) or crack_conductivity_s_per_m < 0:
         raise ValueError("crack conductivity must be finite and nonnegative")
 
@@ -69,16 +125,23 @@ def solve_induced_current(
     volumes = np.full(len(points), np.prod(cell_size))
     delta_sigma = crack_conductivity_s_per_m - conductivity
     if len(points) == 0 or delta_sigma == 0:
-        return np.zeros_like(e_inc), volumes
+        return PreparedInducedCurrentSolver(None, delta_sigma, volumes)
     if field_operator is None:
         field_operator = build_electric_field_operator(
             points, frequency_hz, cell_size_m=cell_size, specimen=specimen
         )
 
     operator = np.eye(n_components, dtype=complex) - delta_sigma * field_operator
-    rhs = (delta_sigma * e_inc).reshape(-1)
-    j_ind = np.linalg.solve(operator, rhs).reshape(-1, 3)
-    return j_ind, volumes
+    # Treat a singular matrix as an error, matching np.linalg.solve.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", LinAlgWarning)
+        try:
+            factorization = lu_factor(operator)
+        except LinAlgWarning as error:
+            raise np.linalg.LinAlgError(
+                "induced-current equation matrix is singular"
+            ) from error
+    return PreparedInducedCurrentSolver(factorization, delta_sigma, volumes)
 
 
 def make_crack_points(

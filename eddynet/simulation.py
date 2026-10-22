@@ -19,6 +19,7 @@ from eddynet.incident_field_solver import MockProbe, solve_incident_field
 from eddynet.induced_current_solver import (
     build_electric_field_operator,
     make_crack_points,
+    prepare_induced_current_solver,
     solve_induced_current,
 )
 
@@ -46,20 +47,11 @@ DEFAULT_SPECIMEN_THICKNESS_M = None
 DEFAULT_X_STEPS = 40
 DEFAULT_Y_STEPS = 40
 
-# Installed once per worker to avoid sending the matrix with every position task.
-_worker_field_operator = None
-
 
 def impedance_change(e_inc, j_ind, weights, source_current):
-    """
-    Args:
-        e_inc: (n_points, 3)
-        j_inc: (n_points, 3)
-        weights: mesh weight for each point
-    """
-
+    """Return one impedance change per field shaped (..., n_points, 3)."""
     pointwise_dot = np.sum(e_inc * j_ind, axis=-1)
-    return -np.sum(pointwise_dot * weights) / source_current**2
+    return -np.sum(pointwise_dot * weights, axis=-1) / source_current**2
 
 
 def generate_crack_profile(x_dim=40, y_dim=12, *, plot=False):
@@ -136,7 +128,7 @@ def generate_test_data(
     x_steps=DEFAULT_X_STEPS,
     y_steps=DEFAULT_Y_STEPS,
 ):
-    """Generate responses using full-grid interaction matrices reused across cracks."""
+    """Reuse full-grid interactions and factor each crack/frequency matrix once."""
     root_dir = Path("data")
     profile_shape = (40, 12)
     full_grid_points = make_crack_points(np.ones(profile_shape, dtype=bool))
@@ -146,11 +138,11 @@ def generate_test_data(
     }
 
     for i in tqdm(range(size)):
-        crack_id = f"{i:6d}"
+        crack_id = f"{i:06d}"
         crack = generate_crack_profile(*profile_shape)
         crack_path = root_dir / "cracks"
         crack_path.mkdir(exist_ok=True, parents=True)
-        np.savez(crack_path / f"{crack_id}.npz")
+        np.savez(crack_path / f"{crack_id}.npz", crack=crack)
         points = make_crack_points(crack)
         cell_indices = np.flatnonzero(crack)
         # Each cell occupies three consecutive matrix rows and columns for XYZ.
@@ -168,14 +160,15 @@ def generate_test_data(
             probe = MockProbe(coil_xy=(0.0, 0.0), current_a=source_current_a)
 
             start = datetime.now()
+            solver = prepare_induced_current_solver(
+                points, freq, field_operator=field_operator
+            )
             # for each coil pos, calculate e_inc at every crack cell
-            response_map = np.ndarray(shape=(x_steps, y_steps), dtype=complex)
             calc = functools.partial(
-                calc_impedance_change_m,
+                calc_incident_field,
                 points=points,
                 freq=freq,
                 probe=probe,
-                source_current_a=source_current_a,
                 scan_step_m=scan_step_m,
             )
             x_range = np.arange(x_steps).tolist()
@@ -184,17 +177,20 @@ def generate_test_data(
             # for one crack
             # mp time 0:02:51.489267
             # sequential time 0:11:25.051254
-            with Pool(
-                initializer=_set_worker_field_operator, initargs=(field_operator,)
-            ) as pool:
-                # TODO: probe needs to move
-                results = pool.starmap(calc, product(x_range, y_range))
+            with Pool() as pool:
+                fields = pool.starmap(calc, product(x_range, y_range))
 
-            for x, y, val in results:
-                response_map[x, y] = val
+            # starmap preserves the row/column order produced by product.
+            e_inc = np.asarray(fields, dtype=complex).reshape(
+                x_steps * y_steps, len(points), 3
+            )
+            j_ind, weights = solver.solve(e_inc)
+            response_map = impedance_change(
+                e_inc, j_ind, weights, source_current_a
+            ).reshape(x_steps, y_steps)
 
             print("mp time", datetime.now() - start)
-            np.savez(freq_path / f"{crack_id}.npz")
+            np.savez(freq_path / f"{crack_id}.npz", delta_z=response_map)
 
 
 def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_map):
@@ -206,26 +202,12 @@ def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_
     response_map[x, y] = delta_z
 
 
-def _set_worker_field_operator(field_operator):
-    """Give each worker this crack's matrix once when its pool starts."""
-    global _worker_field_operator
-    _worker_field_operator = field_operator
-
-
-def calc_impedance_change_m(
-    x, y, points, freq, probe: MockProbe, source_current_a, scan_step_m
-):
-    probe_coil_x = scan_step_m * x
-    probe_coil_y = scan_step_m * y
-    _probe: MockProbe = dataclasses.replace(probe)
-    _probe.coil_xy = (probe_coil_y, probe_coil_x)
-    e_inc = solve_incident_field(points, frequency_hz=freq, probe=_probe)
-    j_ind, weights = solve_induced_current(
-        points, e_inc, freq, field_operator=_worker_field_operator
+def calc_incident_field(row, column, points, freq, probe: MockProbe, scan_step_m):
+    """Return crack-point fields; map rows follow probe y and columns follow x."""
+    positioned_probe = dataclasses.replace(
+        probe, coil_xy=(column * scan_step_m, row * scan_step_m)
     )
-
-    delta_z = impedance_change(e_inc, j_ind, weights, source_current_a)
-    return x, y, delta_z
+    return solve_incident_field(points, frequency_hz=freq, probe=positioned_probe)
 
 
 if __name__ == "__main__":
