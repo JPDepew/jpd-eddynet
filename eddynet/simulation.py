@@ -313,4 +313,4 @@ def calc_incident_field(row, column, points, freq, probe: MockProbe, scan_step_m
 
 if __name__ == "__main__":
     # generate_crack_profile(plot=True)
-    generate_test_data(size=5000, workers=11)
+    generate_test_data(size=20000, workers=11)
