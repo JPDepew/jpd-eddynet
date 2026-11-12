@@ -11,3 +11,4 @@ data/
 
 # Virtual environments
 .venv
+checkpoints/
