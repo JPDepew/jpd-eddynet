@@ -29,7 +29,7 @@ from eddynet.induced_current_solver import (
 # these dimensions or material values, so callers should replace them with
 # values for the probe and material they want to simulate.
 # maybe use 1, 3, and 6 for frequencies
-DEFAULT_FREQUENCIES_MHZ = (2.0, 2.5, 3.0)
+DEFAULT_FREQUENCIES_MHZ = (1.0, 3.0, 6.0)
 DEFAULT_COIL_POSITION_M = (0.0, 0.0)
 DEFAULT_SCAN_STEP_M = 0.1e-3
 DEFAULT_PROFILE_PIXEL_SPACING_Y_M = 0.1e-3

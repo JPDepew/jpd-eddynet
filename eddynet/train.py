@@ -34,11 +34,14 @@ def train():
     net = EddyNet().to(DEVICE)
     optimizer = optim.RAdam(net.parameters(), lr=LR)
 
-    running_loss = []
-    epoch_losses = []
+    train_losses = []
+    running_train_loss = []
+
+    test_losses = []
+    running_test_loss = []
 
     for epoch in range(EPOCHS):
-        for y, profile in tqdm(train_dataloader, desc=f"Epoch {epoch}"):
+        for y, profile in tqdm(train_dataloader, desc=f"Train epoch {epoch}"):
             y, profile = y.to(DEVICE), profile.to(DEVICE)
 
             optimizer.zero_grad()
@@ -50,15 +53,33 @@ def train():
             loss.backward()
 
             optimizer.step()
-            epoch_losses.append(loss.item())
-        epoch_loss = sum(epoch_losses) / len(epoch_losses)
-        running_loss.append(epoch_loss)
-        print(f"Loss for epoch {epoch}: {epoch_loss}")
-        torch.save(net, f"checkpoints/eddynet_epoch={epoch}_loss={epoch_loss}.ckpt")
+            train_losses.append(loss.item())
 
-        epoch_losses = []
+        train_loss = sum(train_losses) / len(train_losses)
+        running_train_loss.append(train_loss)
+        train_losses = []
 
-    plt.plot(running_loss)
+        with torch.inference_mode():
+            net.eval()
+            for y, profile in tqdm(test_dataloader, desc=f"Val epoch {epoch}"):
+                y, profile = y.to(DEVICE), profile.to(DEVICE)
+
+                pred = net(profile)
+
+                loss = F.l1_loss(pred, y)
+                test_losses.append(loss.item())
+
+            test_loss = sum(test_losses) / len(test_losses)
+            running_test_loss.append(test_loss)
+            test_losses = []
+
+            net.train()
+
+        print(f"epoch={epoch} | train_loss={train_loss} | test_loss={test_loss}")
+        torch.save(net, f"checkpoints/eddynet_epoch={epoch}_loss={test_loss}.ckpt")
+
+    plt.plot(running_train_loss)
+    plt.plot(running_test_loss)
     plt.show()
 
 
