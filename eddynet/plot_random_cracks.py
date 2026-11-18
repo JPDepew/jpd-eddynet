@@ -3,13 +3,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data_step=0.3e-3"
 
 
 def plot_random_cracks(root_dir=DATA_DIR, rows=5):
     """Plot cracks beside real and imaginary responses at each frequency.
 
-    Each response column shares a color scale across cracks, centered at zero.
+    Each response panel has its own color scale and colorbar, centered at zero.
     """
     root_dir = Path(root_dir)
     frequency_dirs = sorted(
@@ -49,22 +49,25 @@ def plot_random_cracks(root_dir=DATA_DIR, rows=5):
         for frequency_index, directory in enumerate(frequency_dirs):
             column = 1 + component_index * len(frequency_dirs) + frequency_index
             maps = component(response_maps[frequency_index])
-            # Symmetric limits show the sign; keep all-zero maps centered too.
-            limit = np.max(np.abs(maps)) or 1.0
             for row, response in enumerate(maps):
-                axes[row, column].imshow(
+                # Scale each image independently while keeping zero gray.
+                limit = np.max(np.abs(response)) or 1.0
+                response_image = axes[row, column].imshow(
                     response,
-                    cmap="RdBu_r",
+                    cmap="gray",
                     vmin=-limit,
                     vmax=limit,
                     interpolation="nearest",
                 )
+                figure.colorbar(
+                    response_image,
+                    ax=axes[row, column],
+                    fraction=0.046,
+                    pad=0.04,
+                    ticks=[-limit, 0, limit],
+                    label="delta_z [ohm]",
+                )
             axes[0, column].set_title(f"{directory.name} {label.lower()}")
-            figure.colorbar(
-                axes[0, column].images[0],
-                ax=axes[:, column].tolist(),
-                label=f"{label} delta_z [ohm]",
-            )
     for axis in axes.flat:
         axis.set_xticks([])
         axis.set_yticks([])
