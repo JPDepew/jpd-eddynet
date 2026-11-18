@@ -150,8 +150,14 @@ def precompute_incident_fields(
     scan_step_m,
     workers=DEFAULT_WORKERS,
 ):
-    """Cache fields shaped (scan_positions, grid_cells, 3) for each frequency."""
+    """Cache fields for a scan centered on probe.coil_xy.
+
+    Arrays have shape (scan_positions, grid_cells, 3). Rows follow physical y
+    and columns follow physical x, including when the scan is rectangular.
+    """
     fields_by_frequency = {}
+    row_offsets = np.arange(x_steps) - (x_steps - 1) / 2
+    column_offsets = np.arange(y_steps) - (y_steps - 1) / 2
     with _simulation_pool(workers) as pool:
         for freq_mhz in frequencies_mhz:
             calc = functools.partial(
@@ -162,7 +168,7 @@ def precompute_incident_fields(
                 scan_step_m=scan_step_m,
             )
             # starmap preserves the row/column order produced by product.
-            fields = pool.starmap(calc, product(range(x_steps), range(y_steps)))
+            fields = pool.starmap(calc, product(row_offsets, column_offsets))
             fields_by_frequency[freq_mhz] = np.asarray(fields, dtype=complex).reshape(
                 x_steps * y_steps, len(points), 3
             )
@@ -255,6 +261,7 @@ def generate_test_data(
 
     Workers share read-only grid caches and process all frequencies for a crack.
     The default uses at most four workers to limit memory for per-crack solves.
+    coil_position_m specifies the XY center of the scan, in meters.
     """
     if workers < 1:
         raise ValueError("workers must be positive")
@@ -271,7 +278,7 @@ def generate_test_data(
             cache_dir,
             full_grid_points,
             frequencies_mhz,
-            probe=MockProbe(current_a=source_current_a),
+            probe=MockProbe(coil_xy=coil_position_m, current_a=source_current_a),
             x_steps=x_steps,
             y_steps=y_steps,
             scan_step_m=scan_step_m,
@@ -303,10 +310,16 @@ def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_
     response_map[x, y] = delta_z
 
 
-def calc_incident_field(row, column, points, freq, probe: MockProbe, scan_step_m):
-    """Return crack-point fields; map rows follow probe y and columns follow x."""
+def calc_incident_field(
+    row_offset, column_offset, points, freq, probe: MockProbe, scan_step_m
+):
+    """Return fields at offsets measured in scan steps from probe.coil_xy."""
     positioned_probe = dataclasses.replace(
-        probe, coil_xy=(column * scan_step_m, row * scan_step_m)
+        probe,
+        coil_xy=(
+            probe.coil_xy[0] + column_offset * scan_step_m,
+            probe.coil_xy[1] + row_offset * scan_step_m,
+        ),
     )
     return solve_incident_field(points, frequency_hz=freq, probe=positioned_probe)
 
