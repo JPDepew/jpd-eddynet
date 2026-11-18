@@ -1,13 +1,31 @@
+from itertools import count
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data_step=0.3e-3"
+IMAGE_DIR = Path(__file__).resolve().parents[1] / "crack_profile_img"
+
+
+def _save_plot(figure, data_dir):
+    """Save a PNG named after the data folder, adding a suffix for existing names."""
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    name = data_dir.name.removeprefix("data_")
+    for index in count():
+        suffix = f"_{index}" if index else ""
+        image_path = IMAGE_DIR / f"{name}{suffix}.png"
+        try:
+            image_file = image_path.open("xb")
+        except FileExistsError:
+            continue
+        with image_file:
+            figure.savefig(image_file, format="png", dpi=150, bbox_inches="tight")
+        return image_path
 
 
 def plot_random_cracks(root_dir=DATA_DIR, rows=5):
-    """Plot cracks beside real and imaginary responses at each frequency.
+    """Save cracks beside real and imaginary responses, returning the image path.
 
     Each response panel has its own color scale and colorbar, centered at zero.
     """
@@ -71,9 +89,11 @@ def plot_random_cracks(root_dir=DATA_DIR, rows=5):
     for axis in axes.flat:
         axis.set_xticks([])
         axis.set_yticks([])
-    plt.show()
-    return figure, axes
+    try:
+        return _save_plot(figure, root_dir)
+    finally:
+        plt.close(figure)
 
 
 if __name__ == "__main__":
-    plot_random_cracks()
+    print(plot_random_cracks())
