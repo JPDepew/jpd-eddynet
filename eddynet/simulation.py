@@ -17,8 +17,9 @@ import numpy as np
 from scipy.ndimage import median_filter
 from tqdm import tqdm
 
-from eddynet.incident_field_solver import MockProbe, solve_incident_field
+from eddynet.incident_field_solver import MockProbe, MockSpecimen, solve_incident_field
 from eddynet.induced_current_solver import (
+    DEFAULT_CRACK_CELL_SIZE_M,
     build_electric_field_operator,
     make_crack_points,
     prepare_induced_current_solver,
@@ -149,6 +150,7 @@ def precompute_incident_fields(
     y_steps,
     scan_step_m,
     workers=DEFAULT_WORKERS,
+    specimen=None,
 ):
     """Cache fields for a scan centered on probe.coil_xy.
 
@@ -166,6 +168,7 @@ def precompute_incident_fields(
                 freq=freq_mhz * 1e6,
                 probe=probe,
                 scan_step_m=scan_step_m,
+                specimen=specimen,
             )
             # starmap preserves the row/column order produced by product.
             fields = pool.starmap(calc, product(row_offsets, column_offsets))
@@ -176,18 +179,31 @@ def precompute_incident_fields(
 
 
 def _precompute_simulation_cache(
-    cache_dir, points, frequencies_mhz, *, probe, x_steps, y_steps, scan_step_m, workers
+    cache_dir,
+    points,
+    frequencies_mhz,
+    *,
+    probe,
+    specimen,
+    cell_size_m,
+    x_steps,
+    y_steps,
+    scan_step_m,
+    workers,
 ):
     """Write temporary NumPy files that crack workers can map into shared memory."""
     for index, freq_mhz in enumerate(frequencies_mhz):
         np.save(
             cache_dir / f"operator_{index}.npy",
-            build_electric_field_operator(points, freq_mhz * 1e6),
+            build_electric_field_operator(
+                points, freq_mhz * 1e6, specimen=specimen, cell_size_m=cell_size_m
+            ),
         )
     fields = precompute_incident_fields(
         points,
         frequencies_mhz,
         probe=probe,
+        specimen=specimen,
         x_steps=x_steps,
         y_steps=y_steps,
         scan_step_m=scan_step_m,
@@ -209,12 +225,14 @@ def _initialize_crack_worker(cache_dir, frequencies_mhz):
     }
 
 
-def _save_crack_sample(sample, *, root_dir, source_current_a, response_shape):
+def _save_crack_sample(
+    sample, *, root_dir, source_current_a, response_shape, specimen, cell_size_m
+):
     """Compute and save one crack's frequency maps using the worker's grid cache."""
     index, crack = sample
     crack_id = f"{index:06d}"
     np.savez(root_dir / "cracks" / f"{crack_id}.npz", crack=crack)
-    points = make_crack_points(crack)
+    points = make_crack_points(crack, cell_size_m=cell_size_m)
     cell_indices = np.flatnonzero(crack)
     # Each cell occupies three consecutive matrix rows and columns for XYZ.
     component_indices = (3 * cell_indices[:, None] + np.arange(3)).ravel()
@@ -222,7 +240,11 @@ def _save_crack_sample(sample, *, root_dir, source_current_a, response_shape):
     for freq_mhz, (full_operator, full_fields) in _WORKER_CACHE.items():
         field_operator = full_operator[np.ix_(component_indices, component_indices)]
         solver = prepare_induced_current_solver(
-            points, freq_mhz * 1e6, field_operator=field_operator
+            points,
+            freq_mhz * 1e6,
+            field_operator=field_operator,
+            specimen=specimen,
+            cell_size_m=cell_size_m,
         )
         # The incident field does not depend on which cells form the crack.
         e_inc = full_fields[:, cell_indices, :]
@@ -262,23 +284,54 @@ def generate_test_data(
     Workers share read-only grid caches and process all frequencies for a crack.
     The default uses at most four workers to limit memory for per-crack solves.
     coil_position_m specifies the XY center of the scan, in meters.
+    Probe, material, and profile spacing settings apply to all cached fields and
+    per-crack solves. Finite specimen thickness is not supported.
     """
     if workers < 1:
         raise ValueError("workers must be positive")
+    if specimen_thickness_m is not None:
+        raise NotImplementedError(
+            "Finite specimen thickness is not supported; use specimen_thickness_m=None"
+        )
+    probe = MockProbe(
+        coil_xy=coil_position_m,
+        inner_radius_m=coil_inner_radius_m,
+        outer_radius_m=coil_outer_radius_m,
+        coil_height_m=coil_height_m,
+        turns=coil_turns,
+        current_a=source_current_a,
+        lift_off_m=coil_lift_off_m,
+        core_radius_m=ferrite_core_radius_m,
+        core_height_m=ferrite_core_height_m,
+        core_relative_permeability=ferrite_relative_permeability,
+    )
+    specimen = MockSpecimen(
+        conductivity_s_per_m=specimen_conductivity_s_per_m,
+        relative_permeability=specimen_relative_permeability,
+    )
+    cell_size_m = (
+        DEFAULT_CRACK_CELL_SIZE_M[0],
+        profile_pixel_spacing_y_m,
+        profile_pixel_spacing_z_m,
+    )
     frequencies_mhz = tuple(frequencies_mhz)
-    root_dir = Path("data")
+    root_dir = Path("data_coil_r")
     folders = ["cracks"] + [f"{freq}MHz" for freq in frequencies_mhz]
     for folder in folders:
         (root_dir / folder).mkdir(exist_ok=True, parents=True)
     profile_shape = (40, 12)
-    full_grid_points = make_crack_points(np.ones(profile_shape, dtype=bool))
+    full_grid_points = make_crack_points(
+        np.ones(profile_shape, dtype=bool), cell_size_m=cell_size_m
+    )
     with TemporaryDirectory(prefix="eddynet-") as cache_dir:
         cache_dir = Path(cache_dir)
         _precompute_simulation_cache(
             cache_dir,
             full_grid_points,
             frequencies_mhz,
-            probe=MockProbe(coil_xy=coil_position_m, current_a=source_current_a),
+            probe=probe,
+            specimen=specimen,
+            cell_size_m=cell_size_m,
             x_steps=x_steps,
             y_steps=y_steps,
             scan_step_m=scan_step_m,
@@ -289,6 +342,8 @@ def generate_test_data(
             root_dir=root_dir,
             source_current_a=source_current_a,
             response_shape=(x_steps, y_steps),
+            specimen=specimen,
+            cell_size_m=cell_size_m,
         )
         # Send only small crack masks; the large caches stay mapped in workers.
         samples = ((i, generate_crack_profile(*profile_shape)) for i in range(size))
@@ -301,9 +356,25 @@ def generate_test_data(
                 pass
 
 
-def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_map):
-    e_inc = solve_incident_field(points, frequency_hz=freq, probe=probe)
-    j_ind, weights = solve_induced_current(points, e_inc, freq)
+def calc_impedance_change(
+    x,
+    y,
+    points,
+    freq,
+    probe,
+    source_current_a,
+    response_map,
+    *,
+    specimen=None,
+    cell_size_m=DEFAULT_CRACK_CELL_SIZE_M,
+):
+    """Store one response using matching material and cell dimensions in both solves."""
+    e_inc = solve_incident_field(
+        points, frequency_hz=freq, probe=probe, specimen=specimen
+    )
+    j_ind, weights = solve_induced_current(
+        points, e_inc, freq, specimen=specimen, cell_size_m=cell_size_m
+    )
 
     delta_z = impedance_change(e_inc, j_ind, weights, source_current_a)
 
@@ -311,7 +382,13 @@ def calc_impedance_change(x, y, points, freq, probe, source_current_a, response_
 
 
 def calc_incident_field(
-    row_offset, column_offset, points, freq, probe: MockProbe, scan_step_m
+    row_offset,
+    column_offset,
+    points,
+    freq,
+    probe: MockProbe,
+    scan_step_m,
+    specimen=None,
 ):
     """Return fields at offsets measured in scan steps from probe.coil_xy."""
     positioned_probe = dataclasses.replace(
@@ -321,9 +398,19 @@ def calc_incident_field(
             probe.coil_xy[1] + row_offset * scan_step_m,
         ),
     )
-    return solve_incident_field(points, frequency_hz=freq, probe=positioned_probe)
+    return solve_incident_field(
+        points, frequency_hz=freq, probe=positioned_probe, specimen=specimen
+    )
 
 
 if __name__ == "__main__":
     # generate_crack_profile(plot=True)
-    generate_test_data(size=20000, workers=11)
+    # generate_test_data(size=20000, workers=11)
+    np.random.seed(42)
+    generate_test_data(
+        size=100,
+        workers=11,
+        scan_step_m=0.3e-3,
+        coil_inner_radius_m=0.4e-3,
+        coil_outer_radius_m=1.0e-3,
+    )

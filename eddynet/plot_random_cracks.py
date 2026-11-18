@@ -4,8 +4,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data_step=0.3e-3"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data_coil_r"
 IMAGE_DIR = Path(__file__).resolve().parents[1] / "crack_profile_img"
+
+np.random.seed(42)
 
 
 def _save_plot(figure, data_dir):
@@ -38,7 +40,9 @@ def plot_random_cracks(root_dir=DATA_DIR, rows=5):
     crack_files = sorted((root_dir / "cracks").glob("*.npz"))
     if not 1 <= rows <= len(crack_files):
         raise ValueError(f"rows must be between 1 and {len(crack_files)}")
-    selected = np.random.default_rng().choice(crack_files, size=rows, replace=False)
+    selected = np.random.default_rng(seed=42).choice(
+        crack_files, size=rows, replace=False
+    )
     response_maps = []
     for directory in frequency_dirs:
         maps = []
